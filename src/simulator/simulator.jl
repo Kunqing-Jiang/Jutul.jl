@@ -101,7 +101,8 @@ and combine it with [`simulate!`](@ref).
 - `parameters=setup_parameters(model)`: Optional overrides the default parameters for the model.
 - `forces=nothing`: Either `nothing` (for no forces), a single set of forces from `setup_forces(model)` or a `Vector` of such forces with equal length to `timesteps`.
 - `restart=nothing`: If an integer is provided, the simulation will attempt to restart from that step. Requires that `output_path` is provided here or in the `config`.
-- `config=simulator_config(model)`: Configuration `Dict` that holds many fine grained settings for output, linear solver, time-steps, outputs etc.
+- `config=simulator_config(model)`: Configuration `Dict` that holds many fine grained settings for output, linear solver, time-steps, outputs etc. 
+    Supports additional options such as `:log_wells`, `:log_wells_vars`, and `:log_file_pth` for CSV-based well logging.
 
 Additional arguments are passed onto [`simulator_config`](@ref).
 
@@ -187,6 +188,27 @@ function simulate!(sim::JutulSimulator, timesteps::AbstractVector;
     # Config options
     max_its = config[:max_nonlinear_iterations]
     info_level = config[:info_level]
+
+    # ---- well logger initialization
+    log_wells      = haskey(config, :log_wells)      ? config[:log_wells]      : Symbol[]
+    log_wells_vars = haskey(config, :log_wells_vars) ? config[:log_wells_vars] : Symbol[]
+    log_file_pth   = haskey(config, :log_file_pth)   ? config[:log_file_pth]   : nothing
+
+
+    well_logger = nothing
+    logger_io   = nothing
+    if !isempty(log_wells) && !isempty(log_wells_vars)
+        if log_file_pth === nothing
+            output_path = config[:output_path]
+            if output_path === nothing
+                error("You enabled well logging, but did not provide log_file_pth or config[:output_path].")
+            end
+            log_file_pth = joinpath(output_path, "well_log.csv")
+        end
+        well_logger, logger_io = well_logger_factory(log_wells, log_wells_vars; filepath = log_file_pth)
+    end
+    # -----------------------------
+
     # Initialize loop
     p = start_simulation_message(info_level, timesteps, config)
     early_termination = false
@@ -213,7 +235,9 @@ function simulate!(sim::JutulSimulator, timesteps::AbstractVector;
             reports = reports,
             step_no = step_no,
             rec = rec,
-            substates = substates
+            substates = substates,
+            well_logger=well_logger,
+            kwarg...
         )
         early_termination = !step_done
         subrep = JUTUL_OUTPUT_TYPE()
@@ -247,6 +271,11 @@ function simulate!(sim::JutulSimulator, timesteps::AbstractVector;
     end
     states, reports = retrieve_output!(sim, states, reports, config, n_solved)
     final_simulation_message(sim, p, rec, t_elapsed, reports, timesteps, config, start_date, early_termination)
+    
+    if logger_io !== nothing
+        close(logger_io)
+    end
+
     return SimResult(states, reports, start_timestamp)
 end
 
@@ -273,15 +302,19 @@ function solve_timestep!(sim, dT, forces, max_its, config;
         info_level = config[:info_level],
         rec = progress_recorder(sim),
         substates = missing,
+        well_logger=nothing,
         kwarg...
     )
     ministep_reports = []
+
+
     # Initialize time-stepping
     dt = pick_timestep(sim, config, dt, dT, forces, reports, ministep_reports, step_index = step_no, new_step = true)
     done = false
     t_local = 0
     cut_count = 0
     ctr = 1
+
     while !done
         # Make sure that we hit the endpoint in case timestep selection is too optimistic.
         dt = min(dt, dT - t_local)
@@ -292,12 +325,27 @@ function solve_timestep!(sim, dT, forces, max_its, config;
 
         # We store the report even if it is a failure.
         push!(ministep_reports, s)
+
+
         n_so_far = length(ministep_reports)
         if ok
             if 2 > info_level > 1
                 jutul_message("Convergence", "Ministep #$n_so_far of $(get_tstr(dt, 1)) ($(round(100.0*dt/dT, digits=1))% of report step) converged.", color = :green)
             end
             t_local += dt
+
+            # ---- write well_log (global time) ----
+            if well_logger !== nothing
+                try
+                    state_now = get_output_state(sim.storage, sim.model)
+                    t_global  = (step_no - 1) * dT + t_local
+                    well_logger(step_no, t_global, state_now)
+                catch err
+                    @warn "well_logger callback failed: $err"
+                end
+            end
+            # --------------------------
+
             if t_local >= dT
                 # Onto the next one
                 done = true
@@ -341,6 +389,60 @@ function solve_timestep!(sim, dT, forces, max_its, config;
     end
     return (done, ministep_reports, dt)
 end
+
+
+"""
+    well_logger_factory(log_wells::Vector{Symbol}, vars::Vector{Symbol};
+                        filepath="well_log.csv")
+
+Constructs `(logger, io)`.  
+The `logger` is called at each mini-step, writes one row to the CSV, and flushes immediately.  
+Finally, `solve_timestep!` is responsible for closing `io`.
+"""
+function well_logger_factory(log_wells::Vector{Symbol}, vars::Vector{Symbol};
+                             filepath=nothing)
+    io = open(filepath, "w")
+    # CSV header: step_no, t_global, and one column per variable for each well
+    headers = ["step_no", "t_global"]
+    for w in log_wells
+        for v in vars
+            push!(headers, "$(w)_$(v)")
+        end
+    end
+    println(io, join(headers, ","))
+    flush(io)
+
+    logger = function (step_no, t_global, state)
+        row = [string(step_no), string(t_global)]
+        for w in log_wells
+            if haskey(state, w)
+                well_state = state[w]
+                for v in vars
+                    if haskey(well_state, v)
+                        val = well_state[v]
+                        push!(row, string(val))
+                    else
+                        push!(row, "")
+                    end
+                end
+            else
+                for v in vars
+                    push!(row, "")
+                end
+            end
+        end
+        println(io, join(row, ","))
+        flush(io)  
+    end
+
+    return logger, io
+end
+
+
+
+
+
+
 
 function perform_step!(simulator::JutulSimulator, dt, forces, config; vararg...)
     perform_step!(simulator.storage, simulator.model, dt, forces, config; executor = simulator.executor, vararg...)
@@ -513,7 +615,8 @@ function solve_ministep(sim, dt, forces, max_iter, cfg;
         finalize = true,
         prepare = true,
         relaxation = 1.0,
-        update_explicit = true
+        update_explicit = true,
+        kwarg...
     )
     done = false
     rec = progress_recorder(sim)
